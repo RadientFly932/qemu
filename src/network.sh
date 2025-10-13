@@ -20,6 +20,7 @@ set -Eeuo pipefail
 : "${VM_NET_MASK:="255.255.255.0"}"
 
 : "${PASST:="passt"}"
+: "${PASST_MTU:=""}"
 : "${PASST_OPTS:=""}"
 : "${PASST_DEBUG:=""}"
 
@@ -174,41 +175,36 @@ configureDNS() {
   fi
 
   if [[ "$DNSMASQ_DEBUG" == [Yy1]* ]]; then
-    tail -fn +0 "$log" &
+    tail -fn +0 "$log" --pid=$$ &
   fi
 
   return 0
 }
 
-getUserPorts() {
+compat() {
 
-  local args=""
-  local list=$1
-  local ssh="22"
+  local gateway="$1"
+  local interface="$2"
+  local samba="20.20.20.1"
 
-  [[ "${BOOT_MODE:-}" == "windows"* ]] && ssh="3389"
-  [ -z "$list" ] && list="$ssh" || list+=",$ssh"
+  [[ "$samba" == "$gateway" ]] && return 0
+  [[ "${BOOT_MODE:-}" != "windows"* ]] && return 0
 
-  list="${list//,/ }"
-  list="${list## }"
-  list="${list%% }"
+  if [[ "$interface" != "${interface:0:8}" ]]; then
+    error "Bridge name too long!" && return 1
+  fi
 
-  for port in $list; do
-    proto="tcp"
-    num="$port"
-
-    if [[ "$port" == */udp ]]; then
-      proto="udp"
-      num="${port%/udp}"
-    elif [[ "$port" == */tcp ]]; then
-      proto="tcp"
-      num="${port%/tcp}"
+  # Backwards compatibility with old installations
+  if ip address add dev "$interface" "$samba/24" label "$interface:compat" 2>/dev/null; then
+    SAMBA_INTERFACE="$samba"
+  else
+    msg=$(ip address add dev "$interface" "$samba/24" label "$interface:compat" 2>&1)
+    if [[ "${msg,,}" != *"address already assigned"* && "$PODMAN" != [Yy1]* ]]; then
+      echo "$msg" >&2
+      warn "failed to configure IP alias. $ADD_ERR --cap-add NET_ADMIN"
     fi
+  fi
 
-    args+="hostfwd=$proto::$num-$VM_NET_IP:$num,"
-  done
-
-  echo "${args%?}"
   return 0
 }
 
@@ -229,49 +225,55 @@ getHostPorts() {
 
   if [[ "${WEB:-}" != [Nn]* ]]; then
     [ -z "$list" ] && list="$WEB_PORT" || list+=",$WEB_PORT"
-  fi
-
-  if [[ "${NETWORK,,}" == "passt" ]]; then
-
-    local DNS_PORT="53"
-    local SAMBA_PORT="445"
-
-    if [[ "${DNSMASQ_DISABLE:-}" != [Yy1]* ]]; then
-      [ -z "$list" ] && list="$DNS_PORT" || list+=",$DNS_PORT"
-    fi
-
-    if [[ "${BOOT_MODE:-}" == "windows"* ]]; then
-      if [[ "${SAMBA:-}" != [Nn]* ]]; then
-        [ -z "$list" ] && list="$SAMBA_PORT" || list+=",$SAMBA_PORT"
-      fi
-    fi
-
+    [ -z "$list" ] && list="$WSD_PORT" || list+=",$WSD_PORT"
   fi
 
   echo "$list"
   return 0
 }
 
-compat() {
+getUserPorts() {
 
-  local gateway="$1"
-  local interface="$2"
-  local samba="20.20.20.1"
+  local args=""
+  local list=$1
+  list=$(echo "${list// /}" | sed 's/,*$//g')
 
-  [[ "$samba" == "$gateway" ]] && return 0
-  [[ "${BOOT_MODE:-}" != "windows"* ]] && return 0
+  local ssh="22"
+  [[ "${BOOT_MODE:-}" == "windows"* ]] && ssh="3389"
+  [ -z "$list" ] && list="$ssh" || list+=",$ssh"
 
-  if [[ "$interface" != "${interface:0:8}" ]]; then
-    error "Bridge name too long!" && return 1
-  fi
+  echo "$list"
+  return 0
+}
 
-  # Backwards compatibility with old installations
-  if ip address add dev "$interface" "$samba/24" label "$interface:compat"; then
-    SAMBA_INTERFACE="$samba"
-  else
-    warn "failed to configure IP alias!"
-  fi
+getSlirp() {
 
+  local args=""
+  local list=""
+
+  list=$(getUserPorts)
+  list="${list//,/ }"
+  list="${list## }"
+  list="${list%% }"
+
+  for port in $list; do
+
+    proto="tcp"
+    num="${port%/tcp}"
+
+    if [[ "$port" == *"/udp" ]]; then
+      proto="udp"
+      num="${port%/udp}"
+    elif [[ "$port" != *"/tcp" ]]; then
+      args+="hostfwd=$proto::$num-$VM_NET_IP:$num,"
+      proto="udp"
+      num="${port%/udp}"
+    fi
+
+    args+="hostfwd=$proto::$num-$VM_NET_IP:$num,"
+  done
+
+  echo "${args%?}"
   return 0
 }
 
@@ -293,14 +295,14 @@ configureSlirp() {
 
   NET_OPTS="-netdev user,id=hostnet0,ipv4=on,host=$gateway,net=${gateway%.*}.0/24,dhcpstart=$ip,${ipv6}hostname=$VM_NET_HOST"
 
-  local forward
+  local forward=""
   forward=$(getUserPorts "${USER_PORTS:-}")
   [ -n "$forward" ] && NET_OPTS+=",$forward"
 
   if [[ "${DNSMASQ_DISABLE:-}" != [Yy1]* ]]; then
     cp /etc/resolv.conf /etc/resolv.dnsmasq
-    echo -e "nameserver 127.0.0.1\nsearch .\noptions ndots:0" >/etc/resolv.conf
     configureDNS "lo" "$ip" "$VM_NET_MAC" "$VM_NET_HOST" "$VM_NET_MASK" "$gateway" || return 1
+    echo -e "nameserver 127.0.0.1\nsearch .\noptions ndots:0" >/etc/resolv.conf
   fi
 
   VM_NET_IP="$ip"
@@ -336,17 +338,19 @@ configurePasst() {
   PASST_OPTS+=" -a $ip"
   PASST_OPTS+=" -g $gateway"
   PASST_OPTS+=" -n $VM_NET_MASK"
+  [ -n "$PASST_MTU" ] && PASST_OPTS+=" -m $PASST_MTU"
 
-  exclude=$(getHostPorts "$HOST_PORTS")
+  local forward=""
+  forward=$(getUserPorts "${USER_PORTS:-}")
+  forward="${forward///tcp}"
+  forward="${forward///udp}"
 
-  if [ -z "$exclude" ]; then
-    exclude="all"
-  else
-    exclude="~${exclude//,/,~}"
+  if [ -n "$forward" ]; then
+    forward="%${VM_NET_DEV}/$forward"
+    PASST_OPTS+=" -t $forward"
+    PASST_OPTS+=" -u $forward"
   fi
 
-  PASST_OPTS+=" -t $exclude"
-  PASST_OPTS+=" -u $exclude"
   PASST_OPTS+=" -H $VM_NET_HOST"
   PASST_OPTS+=" -M $GATEWAY_MAC"
   PASST_OPTS+=" -P /var/run/passt.pid"
@@ -362,14 +366,21 @@ configurePasst() {
   [[ "$DEBUG" == [Yy1]* ]] && printf "Passt arguments:\n\n%s\n\n" "${PASST_OPTS// -/$'\n-'}"
 
   if ! $PASST ${PASST_OPTS:+ $PASST_OPTS} >/dev/null 2>&1; then
-    local msg="Failed to start passt, reason: $?"
-    [ -f "$log" ] && cat "$log"
-    error "$msg"
-    return 1
+
+    rm -f "$log"
+    PASST_OPTS="${PASST_OPTS/ -q/}"
+    { $PASST ${PASST_OPTS:+ $PASST_OPTS}; rc=$?; } || :
+
+    if (( rc != 0 )); then
+      [ -f "$log" ] && cat "$log"
+      error "Failed to start passt, reason: $rc"
+      return 1
+    fi
+
   fi
 
   if [[ "$PASST_DEBUG" == [Yy1]* ]]; then
-    tail -fn +0 "$log" &
+    tail -fn +0 "$log" --pid=$$ &
   else
     if [[ "$DEBUG" == [Yy1]* ]]; then
       [ -f "$log" ] && cat "$log" && echo ""
@@ -420,7 +431,7 @@ configureNAT() {
   else
     ip="172.31.$base"
   fi
-  
+
   [ -n "$VM_NET_IP" ] && ip="$VM_NET_IP"
 
   local gateway=""
@@ -547,14 +558,24 @@ closeBridge() {
   return 0
 }
 
+closeWeb() {
+
+  # Shutdown nginx
+  nginx -s stop 2> /dev/null
+  fWait "nginx"
+
+  # Shutdown websocket
+  local pid="/var/run/websocketd.pid"
+  [ -s "$pid" ] && pKill "$(<"$pid")"
+  rm -f "$pid"
+
+  return 0
+}
+
 closeNetwork() {
 
   if [[ "${WEB:-}" != [Nn]* ]]; then
-
-    # Shutdown nginx
-    nginx -s stop 2> /dev/null
-    fWait "nginx"
-
+    closeWeb
   fi
 
   [[ "$NETWORK" == [Nn]* ]] && return 0
@@ -631,12 +652,17 @@ getInfo() {
   fi
 
   GATEWAY=$(ip route list dev "$VM_NET_DEV" | awk ' /^default/ {print $3}' | head -n 1)
-  IP=$(ip address show dev "$VM_NET_DEV" | grep inet | awk '/inet / { print $2 }' | cut -f1 -d/ | head -n 1)
-  IP6=""
+  { IP=$(ip address show dev "$VM_NET_DEV" | grep inet | awk '/inet / { print $2 }' | cut -f1 -d/ | head -n 1); rc=$?; } 2>/dev/null || :
 
+  if (( rc != 0 )) && [[ "$DHCP" != [Yy1]* ]]; then
+    error "Could not determine container IP address!" && exit 26
+  fi
+
+  IP6=""
   # shellcheck disable=SC2143
   if [ -f /proc/net/if_inet6 ] && [ -n "$(ifconfig -a | grep inet6)" ]; then
-    IP6=$(ip -6 addr show dev "$VM_NET_DEV" scope global up)
+    { IP6=$(ip -6 addr show dev "$VM_NET_DEV" scope global up); rc=$?; } 2>/dev/null || :
+    (( rc != 0 )) && IP6=""
     [ -n "$IP6" ] && IP6=$(echo "$IP6" | sed -e's/^.*inet6 \([^ ]*\)\/.*$/\1/;t;d' | head -n 1)
   fi
 
@@ -682,11 +708,6 @@ getInfo() {
 
   [ -z "$MTU" ] && MTU="$mtu"
   [ -z "$MTU" ] && MTU="0"
-
-  if [ "$MTU" -gt "1500" ]; then
-    [[ "$DEBUG" == [Yy1]* ]] && echo "MTU size is too large: $MTU, ignoring..."
-    MTU="0"
-  fi
 
   if [[ "${ADAPTER,,}" != "virtio-net-pci" ]]; then
     if [[ "$MTU" != "0" && "$MTU" != "1500" ]]; then
@@ -785,13 +806,7 @@ else
 
   esac
 
-  if [[ "${NETWORK,,}" == "user"* ]]; then
-    if [[ "${ADAPTER,,}" != "rtl8139" ]]; then
-      NETWORK="passt"
-    else
-      NETWORK="slirp"
-    fi
-  fi
+  [[ "${NETWORK,,}" == "user"* ]] && NETWORK="passt"
 
   case "${NETWORK,,}" in
     "nat" | "tap" | "tun" | "tuntap" | "y" ) ;;
@@ -809,14 +824,19 @@ else
       if ! configureSlirp; then
         error "Failed to configure user-mode networking!"
         exit 24
-      fi
-
-      if [ -z "$USER_PORTS" ]; then
-        info "Notice: slirp networking is active, so when you want to expose ports, you will need to map them using this variable: \"USER_PORTS=80,443\"."
       fi ;;
 
     *)
       error "Unrecognized NETWORK value: \"$NETWORK\"" && exit 24 ;;
+  esac
+
+  case "${NETWORK,,}" in
+    "passt" | "slirp" )
+
+      if [ -z "$USER_PORTS" ]; then
+        info "Notice: because user-mode networking is active, if you need to expose ports, add them to the \"USER_PORTS\" variable."
+      fi ;;
+
   esac
 
 fi
